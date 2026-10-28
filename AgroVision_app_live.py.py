@@ -45,6 +45,46 @@ def esp32_set_crop(base_url, crop_name):
     except Exception as exc:
         return None, str(exc)
 
+
+# -------------------- THINGSPEAK CLOUD TELEMETRY --------------------
+# Configure these in Streamlit Cloud -> App settings -> Secrets.
+# Keep the channel private and use a READ API key here.
+def thingspeak_get_latest():
+    try:
+        channel_id = str(st.secrets["THINGSPEAK_CHANNEL_ID"]).strip()
+        read_key = str(st.secrets.get("THINGSPEAK_READ_API_KEY", "")).strip()
+        params = {"results": 1}
+        if read_key:
+            params["api_key"] = read_key
+        response = requests.get(
+            f"https://api.thingspeak.com/channels/{channel_id}/feeds.json",
+            params=params,
+            timeout=6,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        feeds = payload.get("feeds") or []
+        if not feeds:
+            return None, "ThingSpeak has no readings yet."
+        feed = feeds[-1]
+        def number(field):
+            value = feed.get(f"field{field}")
+            return float(value) if value not in (None, "") else None
+        status = {
+            "temperature_c": number(1),
+            "humidity_pct": number(2),
+            "temperature_alert": bool(number(3)),
+            "sensor_fault": bool(number(4)),
+            "buzzer_on": bool(number(5)),
+            "created_at": feed.get("created_at"),
+            "source": "ThingSpeak cloud",
+        }
+        return status, None
+    except KeyError:
+        return None, "Configure THINGSPEAK_CHANNEL_ID in Streamlit Secrets."
+    except Exception as exc:
+        return None, f"ThingSpeak read failed: {exc}"
+
 CROP_PROFILES = {
     "Tomato": (8.0, 10.0),
     "Leafy Greens": (2.0, 5.0),
@@ -159,7 +199,11 @@ st.caption("Solar-powered smart mini cold storage • Student prototype")
 # Read the current DevKit status for the summary cards. The detailed panel refreshes independently.
 summary_esp32, summary_esp32_error = esp32_get_status(ESP32_DEFAULT_URL)
 if summary_esp32_error:
-    st.info("Tomato AI and batch records are available. ESP32 is not reachable at the configured local address yet.")
+    summary_esp32, cloud_error = thingspeak_get_latest()
+    if summary_esp32:
+        st.success("Cloud telemetry connected · readings received from ThingSpeak")
+    else:
+        st.info("Tomato AI and batch records are available. Local ESP32 is not reachable and cloud telemetry is not available yet.")
 else:
     st.success(f"ESP32 connected · {summary_esp32.get('ip', ESP32_DEFAULT_URL)} · live telemetry available")
 
@@ -457,7 +501,7 @@ with tab_history:
 
 with tab_hardware:
     st.subheader("🌡️ Temperature, Crop Mode & Fault Monitoring")
-    st.write("Laptop and ESP32 DevKit must be on the same local Wi-Fi network for this direct connection.")
+    st.write("Local controls require the same Wi-Fi as the ESP32. ThingSpeak cloud readings can be viewed remotely.")
     esp32_url = st.text_input(
         "ESP32 DevKit URL",
         value=st.session_state.get("esp32_url", ESP32_DEFAULT_URL),
@@ -493,14 +537,20 @@ with tab_hardware:
             def render_esp32_status():
                 status, status_error = esp32_get_status(esp32_url)
                 if status_error:
-                    st.error("ESP32 not reachable. Confirm the laptop and DevKit are on the same Wi-Fi and the IP is current.")
-                    st.caption(f"Connection detail: {status_error}")
-                    st.metric("Current temperature", "—")
-                    st.metric("Humidity", "—")
-                    st.metric("Sensor / alert status", "Not connected")
-                    return
-
-                st.success(f"ESP32 connected · {status.get('ip', 'local network')}")
+                    status, cloud_error = thingspeak_get_latest()
+                    if not status:
+                        st.error("Neither local ESP32 nor ThingSpeak cloud telemetry is available.")
+                        st.caption(f"Local connection: {status_error}")
+                        st.caption(f"Cloud connection: {cloud_error}")
+                        st.metric("Current temperature", "—")
+                        st.metric("Humidity", "—")
+                        st.metric("Sensor / alert status", "Not connected")
+                        return
+                    st.success("Cloud telemetry connected · ThingSpeak")
+                    if status.get("created_at"):
+                        st.caption(f"Last cloud reading: {status['created_at']} (UTC)")
+                else:
+                    st.success(f"ESP32 connected · {status.get('ip', 'local network')}")
                 temp_value = status.get("temperature_c")
                 humidity_value = status.get("humidity_pct")
                 m1, m2 = st.columns(2)
@@ -527,7 +577,7 @@ with tab_hardware:
             else:
                 st.json(status)
 
-    st.info("This is a local-network integration. The DevKit firmware provides local telemetry and crop selection; it does not control a compressor or relay. Public cloud access requires a separate secure backend/relay and is not achieved by this local IP alone.")
+    st.info("ThingSpeak is used for remote sensor readings only. Crop-mode commands still require direct local Wi-Fi access to the ESP32. This prototype does not control a compressor or relay.")
 
 # -------------------- ESP32 LIVE CAMERA + AI --------------------
 with tab_live:
